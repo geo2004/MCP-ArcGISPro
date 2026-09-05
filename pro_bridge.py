@@ -1,9 +1,19 @@
 """
 ArcGIS Pro MCP Bridge
 =====================
-Run this script ONCE in ArcGIS Pro's built-in Python window:
+Launch ONCE per ArcGIS Pro session. PREFERRED: use the "MCP Bridge" toolbox
+(Start button) — it sets __file__ so the optional hardening/recipes/socket layer
+loads automatically.
 
-    exec(open(r"C:/Users/User/Documents/MCP-ArcgisPro/pro_bridge.py").read())
+Manual alternative in the Python window — pass __file__ so the hardening package
+(which lives next to this script) is importable; without it, recipes/socket are
+silently unavailable:
+
+    p = r"C:/path/to/MCP-ArcGISPro/pro_bridge.py"
+    exec(open(p).read(), {"__file__": p})
+
+(Plain `exec(open(p).read())` still runs the core bridge, but only with the
+built-in defaults — no hardening, no recipes, no socket transport.)
 
 Strategy:
   - arcpy.mp.ArcGISProject("CURRENT") is called ONCE in the main thread and cached.
@@ -45,8 +55,21 @@ arcpy.env.overwriteOutput = True
 import sys
 _HARDENING = False
 try:
-    _base = os.path.dirname(os.path.abspath(__file__))
-    if _base not in sys.path:
+    # Locate the repo dir robustly. __file__ is set when launched via the toolbox;
+    # in the documented `exec(open(...).read())` manual launch it is undefined, so
+    # fall back to scanning cwd + sys.path for the 'hardening' package.
+    _base = None
+    try:
+        _base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        for _cand in [os.getcwd()] + list(sys.path):
+            try:
+                if _cand and os.path.isdir(os.path.join(_cand, "hardening")):
+                    _base = _cand
+                    break
+            except Exception:
+                pass
+    if _base and _base not in sys.path:
         sys.path.insert(0, _base)
     from hardening.bridge_config import BridgeConfig
     from hardening.bridge_safety import check_gp_tool, check_execute_python, SafetyError
@@ -59,9 +82,14 @@ try:
 except Exception as _e:  # noqa: BLE001 - graceful fallback by design
     print("[MCP Bridge] Hardening not loaded (%r); using built-in defaults." % _e)
 
+    LOG = None  # audit() below is a no-op, but LOG must exist (was a silent NameError per command)
+
     class _CFG:
         protocol_version = 1
-        auto_create_map = False
+        # Fallback (no hardening) preserves the ORIGINAL base-bridge behavior of
+        # auto-creating a map. The safer auto_create_map=False default only applies
+        # when the hardening config is actually in effect.
+        auto_create_map = True
     CFG = _CFG()
 
     class SafetyError(Exception):
@@ -139,6 +167,12 @@ def handle_ping(_args):
         "maps":         map_list,
         "activeMap":    active_map.name if active_map else None,
         "activeView":   view_info,
+        # Additive diagnostics: lets the client explain 'Policy:' rejections
+        # (execute_python disabled / GP tool blocked) instead of blind retries.
+        "hardening":    _HARDENING,
+        "safeMode":     getattr(CFG, "safe_mode", None),
+        "executePythonEnabled": (not getattr(CFG, "safe_mode", False))
+                                or bool(getattr(CFG, "allow_execute_python", False)),
     })
 
 
@@ -159,7 +193,14 @@ def handle_get_active_map_name(_args):
 
 def handle_list_layers(args):
     map_name = args.get("map_name")
-    m = _proj.listMaps(map_name)[0] if map_name else _proj.activeMap
+    if map_name:
+        maps = _proj.listMaps(map_name)
+        if not maps:
+            raise RuntimeError("Map '%s' not found. Available: %s"
+                               % (map_name, [mm.name for mm in _proj.listMaps()]))
+        m = maps[0]
+    else:
+        m = _proj.activeMap
     if m is None:
         raise RuntimeError("No map found.")
     layers = [{"name": lyr.name, "visible": lyr.visible,
@@ -295,16 +336,33 @@ def handle_run_geoprocessing(args):
     if not tool_path:
         raise ValueError("'tool' is required (e.g. 'analysis.Buffer')")
     check_gp_tool(tool_path, CFG)
-    # Resolve any params that are layer NAMES into their dataSource path.
-    # No-op for distances ("10 Meters"), field names, numbers, output paths.
-    params = [resolve_param(arcpy, _proj.activeMap, p) for p in params]
+    # Resolve ONLY the first positional parameter if it is a layer NAME -> its
+    # dataSource path. The first argument is the input dataset for virtually every
+    # tool; resolving every string would corrupt non-dataset args (field names,
+    # SQL/value strings) that happen to match a layer name, e.g.
+    # management.AddField(table, "Roads", "TEXT") when a "Roads" layer exists.
+    # Use _get_map() (falls back to the first map when no view is active). For tools
+    # with additional dataset inputs, pass those as full paths.
+    if params:
+        try:
+            _gp_map = _get_map()
+        except Exception:
+            _gp_map = None
+        params = [resolve_param(arcpy, _gp_map, params[0])] + list(params[1:])
     parts = tool_path.split(".")
-    if len(parts) == 2:
-        fn = getattr(getattr(arcpy, parts[0]), parts[1])
-    elif len(parts) == 1:
-        fn = getattr(arcpy, parts[0])
-    else:
-        raise ValueError(f"Invalid tool path: {tool_path}")
+    try:
+        if len(parts) == 2:
+            fn = getattr(getattr(arcpy, parts[0]), parts[1])
+        elif len(parts) == 1:
+            fn = getattr(arcpy, parts[0])
+        else:
+            raise ValueError(f"Invalid tool path: {tool_path}")
+    except AttributeError:
+        raise ValueError(
+            f"Geoprocessing tool not found: '{tool_path}'. Check the spelling and use "
+            f"the dotted form '<toolbox>.<Tool>' (e.g. 'analysis.Buffer', "
+            f"'management.Project') or the legacy '<Tool>_<toolbox>' form."
+        )
     result = fn(*params)
     outputs = [result.getOutput(i) for i in range(result.outputCount)]
     return _ok({"tool": tool_path, "outputs": outputs})
@@ -359,33 +417,59 @@ def handle_list_fields(args):
     return _ok({"dataset": dataset, "fields": fields, "count": len(fields)})
 
 
+# These three listings are read-only queries. When a caller passes an explicit
+# `workspace`, we temporarily point arcpy.env.workspace at it JUST to run the list,
+# then restore the previous value in a finally block — a query must not mutate the
+# project's global workspace as a side effect. To set the workspace intentionally,
+# callers use set_workspace(). The returned "workspace" is the one actually listed
+# (the passed workspace, or the current one when none was given), which is what the
+# caller expects to see the results for.
+
 def handle_list_feature_classes(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
     feat_type = args.get("feature_type", "")  # Point, Line, Polygon, etc.
-    if workspace:
-        arcpy.env.workspace = workspace
-    fcs = arcpy.ListFeatureClasses(pattern, feat_type) or []
-    return _ok({"workspace": arcpy.env.workspace, "feature_classes": sorted(fcs)})
+    _prev = arcpy.env.workspace
+    try:
+        if workspace:
+            arcpy.env.workspace = workspace
+        listed_ws = arcpy.env.workspace
+        fcs = arcpy.ListFeatureClasses(pattern, feat_type) or []
+    finally:
+        if workspace:
+            arcpy.env.workspace = _prev
+    return _ok({"workspace": listed_ws, "feature_classes": sorted(fcs)})
 
 
 def handle_list_rasters(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
     raster_type = args.get("raster_type", "")
-    if workspace:
-        arcpy.env.workspace = workspace
-    rasters = arcpy.ListRasters(pattern, raster_type) or []
-    return _ok({"workspace": arcpy.env.workspace, "rasters": sorted(rasters)})
+    _prev = arcpy.env.workspace
+    try:
+        if workspace:
+            arcpy.env.workspace = workspace
+        listed_ws = arcpy.env.workspace
+        rasters = arcpy.ListRasters(pattern, raster_type) or []
+    finally:
+        if workspace:
+            arcpy.env.workspace = _prev
+    return _ok({"workspace": listed_ws, "rasters": sorted(rasters)})
 
 
 def handle_list_tables(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
-    if workspace:
-        arcpy.env.workspace = workspace
-    tables = arcpy.ListTables(pattern) or []
-    return _ok({"workspace": arcpy.env.workspace, "tables": sorted(tables)})
+    _prev = arcpy.env.workspace
+    try:
+        if workspace:
+            arcpy.env.workspace = workspace
+        listed_ws = arcpy.env.workspace
+        tables = arcpy.ListTables(pattern) or []
+    finally:
+        if workspace:
+            arcpy.env.workspace = _prev
+    return _ok({"workspace": listed_ws, "tables": sorted(tables)})
 
 
 def handle_set_workspace(args):
@@ -471,11 +555,25 @@ def handle_describe_data(args):
     }
     if hasattr(desc, "spatialReference"):
         sr = desc.spatialReference
+        # Distinguish an UNDEFINED/unknown CRS from a real geographic one. The old
+        # code collapsed everything non-"Projected" to "Geographic", so a dataset
+        # with no coordinate system was reported as Geographic and made the agent
+        # reproject a file that has no source CRS to reproject FROM. arcpy reports an
+        # undefined SR as type "Unknown" with name "Unknown"/factoryCode 0.
+        sr_type = getattr(sr, "type", None) if sr is not None else None
+        sr_name = getattr(sr, "name", None) if sr is not None else None
+        sr_wkid = getattr(sr, "factoryCode", 0) if sr is not None else 0
+        if sr is None or sr_name in (None, "", "Unknown") or not sr_wkid:
+            reported_type = "Unknown"
+        elif sr_type in ("Projected", "Geographic"):
+            reported_type = sr_type
+        else:
+            reported_type = "Unknown"
         result["spatialReference"] = {
-            "name": sr.name,
-            "wkid": sr.factoryCode,
-            "type": "Projected" if sr.type == "Projected" else "Geographic",
-            "linearUnitName": sr.linearUnitName if sr.type == "Projected" else None,
+            "name": sr_name,
+            "wkid": sr_wkid,
+            "type": reported_type,
+            "linearUnitName": (sr.linearUnitName if reported_type == "Projected" else None),
         }
     if hasattr(desc, "shapeType"):
         result["shapeType"] = desc.shapeType
@@ -509,13 +607,29 @@ def handle_create_layout(args):
     units    = args.get("units", "INCH")
     margin   = float(args.get("margin", 0.5))
 
+    # Resolve the map BEFORE creating the layout, so a bad map_name doesn't
+    # leave an orphan empty layout in the project.
+    if map_name:
+        maps = _proj.listMaps(map_name)
+        if not maps:
+            raise RuntimeError("Map '%s' not found. Available: %s"
+                               % (map_name, [mm.name for mm in _proj.listMaps()]))
+        m = maps[0]
+    else:
+        m = _get_map()
+
     layout = _proj.createLayout(width, height, units, name)
-    m = _proj.listMaps(map_name)[0] if map_name else _get_map()
 
     # Page-coordinate extent for the map frame (inset by margin on all sides)
     ext = arcpy.Extent(margin, margin, width - margin, height - margin)
     mf  = layout.createMapFrame(ext, m)
-    mf.camera.setExtent(mf.getLayerExtent(m.listLayers()[0]) if m.listLayers() else mf.camera.getExtent())
+    try:
+        if m.listLayers():
+            mf.camera.setExtent(mf.getLayerExtent(m.listLayers()[0]))
+    except Exception as e:  # noqa: BLE001 - initial zoom is best-effort
+        # Don't fail layout creation just because the initial extent couldn't be
+        # computed (e.g. first layer is a basemap/group layer with no extent).
+        print("[MCP Bridge] create_layout: could not set initial extent (%s)." % e)
 
     return _ok({
         "layout":   layout.name,
@@ -708,6 +822,38 @@ def handle_publish_web_layer(args):
 
 # ── Dispatch table ────────────────────────────────────────────────────────────
 
+def handle_recipe(args):
+    """Run a high-value recipe by name (qa_layer, export_attributes_csv, batch_export_layouts)."""
+    name = args.get("name")
+    params = args.get("params", {}) or {}
+    if not name:
+        raise ValueError("'name' is required (e.g. 'qa_layer')")
+    import importlib
+    from hardening import recipes as _recipes_mod
+    importlib.reload(_recipes_mod)  # hot-reload so new/edited recipes need no bridge restart
+    RECIPES = _recipes_mod.RECIPES
+    fn = RECIPES.get(name)
+    if not fn:
+        raise ValueError("Unknown recipe '%s'. Available: %s" % (name, sorted(RECIPES)))
+    # Gate recipes through the SAME safe_mode policy as run_geoprocessing/execute_python
+    # so they aren't an unrestricted side door: every GP tool a recipe declares must
+    # pass check_gp_tool (allowlist + blocklist), and any recipe that runs arbitrary
+    # code must pass check_execute_python. A recipe that reads only (cursors/Describe/
+    # mp exports) declares no GP tool and is allowed. Raises SafetyError if blocked.
+    for _t in (getattr(fn, "gp_tools", []) or []):
+        check_gp_tool(_t, CFG)
+    if getattr(fn, "needs_execute_python", False):
+        check_execute_python(CFG)
+    # Use _get_map() (falls back to the first map when no view is active) instead of
+    # _proj.activeMap (None without an open view). Defensive None fallback for recipes
+    # that don't need a map (e.g. batch_export_layouts).
+    try:
+        _m = _get_map()
+    except Exception:
+        _m = None
+    return _ok(fn(arcpy=arcpy, m=_m, proj=_proj, **params))
+
+
 HANDLERS = {
     "ping":                handle_ping,
     "get_project_info":    handle_get_project_info,
@@ -742,6 +888,12 @@ HANDLERS = {
     "publish_web_layer":   handle_publish_web_layer,
 }
 
+# Expose recipes only when the hardening package actually loaded — otherwise the
+# 'recipe' op would import hardening.recipes and raise ModuleNotFoundError. When it
+# is not registered, run_recipe gets a clean "Unknown command: 'recipe'" instead.
+if _HARDENING:
+    HANDLERS["recipe"] = handle_recipe
+
 # ── Background polling thread ─────────────────────────────────────────────────
 
 _bridge_active = True
@@ -754,20 +906,40 @@ def _poll_loop():
         except FileNotFoundError:
             pass
 
+    # Adaptive backoff: poll fast (5 ms) right after activity so a quick command is
+    # picked up almost instantly, then grow the idle sleep toward the configured
+    # poll_interval cap while nothing is happening. Replaces the fixed 0.1 s wait,
+    # which added up to 100 ms of latency to every file-IPC command.
+    _MIN_POLL = 0.005
+    _MAX_POLL = float(getattr(CFG, "poll_interval", 0.1)) or 0.1
+    _idle = _MIN_POLL
+
     while _bridge_active:
         try:
             if not os.path.exists(CMD_FILE):
-                time.sleep(0.1)
+                time.sleep(_idle)
+                _idle = min(_idle * 2, _MAX_POLL)
                 continue
 
+            _idle = _MIN_POLL  # command present -> stay responsive for the next one
+
             if os.path.exists(LOCK_FILE):
-                time.sleep(0.05)
+                time.sleep(_MIN_POLL)
                 continue
 
             open(LOCK_FILE, "w").close()
             try:
-                with open(CMD_FILE, "r", encoding="utf-8") as f:
-                    cmd = json.load(f)
+                try:
+                    with open(CMD_FILE, "r", encoding="utf-8") as f:
+                        cmd = json.load(f)
+                except (json.JSONDecodeError, ValueError) as e:
+                    # Corrupt/garbage command file: discard it and answer with a
+                    # readable error instead of retrying it forever.
+                    os.remove(CMD_FILE)
+                    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                        json.dump(_err("Malformed command file (invalid JSON): %s" % e),
+                                  f, default=str)
+                    continue
                 os.remove(CMD_FILE)
 
                 op      = cmd.get("op", "")
@@ -787,10 +959,11 @@ def _poll_loop():
                 # hardening: stamp protocol version + write an audit line
                 if isinstance(result, dict):
                     result.setdefault("protocol", getattr(CFG, "protocol_version", 1))
-                try:
-                    audit(LOG, op, cmd.get("args", {}), result.get("ok"), (time.time() - _t0) * 1000)
-                except Exception:
-                    pass
+                if getattr(CFG, "audit", True):
+                    try:
+                        audit(LOG, op, cmd.get("args", {}), result.get("ok"), (time.time() - _t0) * 1000)
+                    except Exception:
+                        pass
 
                 with open(RESULT_FILE, "w", encoding="utf-8") as f:
                     json.dump(result, f, default=str)
@@ -804,6 +977,12 @@ def _poll_loop():
             print(f"[MCP Bridge] Poll error: {e}")
             time.sleep(0.1)
 
+    # loop exited (_bridge_active=False) — also stop the socket transport if running
+    try:
+        _transport.stop()
+    except Exception:
+        pass
+
 # ── Start ─────────────────────────────────────────────────────────────────────
 
 _thread = threading.Thread(target=_poll_loop, daemon=True, name="MCP-Bridge")
@@ -813,3 +992,43 @@ print(f"[MCP Bridge] Bridge is active. Listening for commands from Claude Deskto
 print(f"[MCP Bridge] Project : {_proj.filePath or '(unsaved)'}")
 print(f"[MCP Bridge] IPC dir : {IPC_DIR}")
 print(f"[MCP Bridge] To stop : _bridge_active = False")
+
+# ── Optional socket transport (additive; file IPC stays as the fallback) ──────
+_transport = None
+try:
+    from hardening.bridge_transport import TransportServer, write_port_file
+
+    def _dispatch(op, args):
+        handler = HANDLERS.get(op)
+        if not handler:
+            return _err("Unknown command: '%s'" % op)
+        _t0 = time.time()
+        try:
+            result = handler(args or {})
+        except SafetyError as e:
+            result = _err("Policy: %s" % e)
+        except Exception as e:
+            result = _err("%s: %s" % (type(e).__name__, e))
+        if isinstance(result, dict):
+            result.setdefault("protocol", getattr(CFG, "protocol_version", 1))
+        # same observability as the file poll loop (this is now the preferred path)
+        if getattr(CFG, "audit", True):
+            try:
+                audit(LOG, op, args or {}, result.get("ok"), (time.time() - _t0) * 1000)
+            except Exception:
+                pass
+        return result
+
+    _ttoken = os.urandom(8).hex()  # per-launch nonce so clients can verify the peer
+    # Wait for the worker up to the SAME configured timeout the client uses (was a
+    # hardcoded 600 s inside the transport). A geoprocessing run longer than the old
+    # literal no longer makes the server reply "no response" while the worker is still
+    # busy. The client's request timeout (also CFG.timeout_seconds) trips first, so a
+    # too-slow op surfaces as a not-retried 'transport-inflight' rather than a phantom.
+    _resp_timeout = getattr(CFG, "timeout_seconds", None)
+    _transport = TransportServer(_dispatch, token=_ttoken, response_timeout=_resp_timeout)
+    _tport = _transport.start()
+    write_port_file(IPC_DIR, _tport, _ttoken)
+    print("[MCP Bridge] Socket transport on 127.0.0.1:%d (file IPC still active)." % _tport)
+except Exception as _te:
+    print("[MCP Bridge] Socket transport not started (%r); file IPC only." % _te)

@@ -61,9 +61,9 @@ def main():
         # port file round-trip (per-session discovery)
         import tempfile
         d = tempfile.mkdtemp()
-        bt.write_port_file(d, port)
-        host2, port2 = bt.read_port_file(d)
-        check("port file round-trip", port2 == port and host2 == bt.HOST)
+        bt.write_port_file(d, port, "tok123")
+        host2, port2, tok2 = bt.read_port_file(d)
+        check("port file round-trip (host/port/token)", port2 == port and host2 == bt.HOST and tok2 == "tok123")
 
         # concurrency: many simultaneous clients, each gets the correct answer
         results = {}
@@ -84,6 +84,56 @@ def main():
         check("25 concurrent clients, no errors", not errors)
         check("each concurrent response correlated correctly",
               all(results.get(i) == i for i in range(25)))
+
+        # P1: connecting to a dead port -> 'transport-connect:' (safe to fall back)
+        dead = bt.send_request(99, "ping", timeout=2)
+        check("dead port -> transport-connect (pre-dispatch)",
+              str(dead.get("error", "")).startswith("transport-connect:"))
+        # a successful response never carries a transport-* error
+        good = bt.send_request(port, "ping", timeout=5)
+        check("live request has no transport error", not str(good.get("error", "") or "").startswith("transport-"))
+
+        # P2: token handshake — wrong token is treated as a pre-dispatch failure
+        tsrv = bt.TransportServer(dispatch, token="secret")
+        tport = tsrv.start()
+        try:
+            okt = bt.send_request(tport, "ping", token="secret", timeout=5)
+            check("correct token -> request succeeds", okt.get("data") == "pong")
+            badt = bt.send_request(tport, "ping", token="WRONG", timeout=5)
+            check("wrong token -> transport-connect (fallback)",
+                  str(badt.get("error", "")).startswith("transport-connect:"))
+        finally:
+            tsrv.stop()
+
+        # roadmap #1: the worker-wait is CONFIGURABLE, not a hardcoded 600 s literal
+        check("default response_timeout is 600",
+              bt.TransportServer(dispatch).response_timeout == 600)
+        check("custom response_timeout honored",
+              bt.TransportServer(dispatch, response_timeout=42).response_timeout == 42)
+        check("non-positive response_timeout falls back to default",
+              bt.TransportServer(dispatch, response_timeout=0).response_timeout == 600)
+
+        # An op slower than the configured wait -> the connection thread stops
+        # blocking and replies (ok False) instead of hanging on a fixed 600 s. The
+        # op keeps running on the worker; the client is just told there's no
+        # response yet (this is what a >timeout geoprocessing run now does cleanly).
+        slowsrv = bt.TransportServer(dispatch, response_timeout=0.05)
+        sport = slowsrv.start()
+        try:
+            r = bt.send_request(sport, "slow", {"n": 7}, timeout=5)
+            check("op slower than response_timeout -> ok False", r.get("ok") is False)
+            check("slow op reply is the 'no response' fallback",
+                  "no response" in (r.get("error") or ""))
+        finally:
+            slowsrv.stop()
+
+        # roadmap #4: hardening port.json permissions must never break the write
+        import tempfile as _tf
+        pd = _tf.mkdtemp()
+        pp = bt.write_port_file(pd, port, "tok-perms")
+        check("port file still written after permission hardening", os.path.exists(pp))
+        _h, _p, _t = bt.read_port_file(pd)
+        check("hardened port file still round-trips", _p == port and _t == "tok-perms")
 
         # latency sanity: a request returns well under the old 0.1s poll floor
         t0 = time.time()

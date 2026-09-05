@@ -89,8 +89,14 @@ Every session, before using Claude:
 4. Run:
 
 ```python
-exec(open(r"C:/path/to/MCP-ArcgisPro/pro_bridge.py").read())
+p = r"C:/path/to/MCP-ArcGISPro/pro_bridge.py"
+exec(open(p).read(), {"__file__": p})
 ```
+
+> Passing `{"__file__": p}` lets the optional hardening/recipes/socket layer (which
+> lives next to `pro_bridge.py`) load. Plain `exec(open(p).read())` still runs the
+> core bridge, but only with built-in defaults. Easiest of all: use the **MCP Bridge
+> toolbox** (Start button), which handles this for you.
 
 You should see:
 ```

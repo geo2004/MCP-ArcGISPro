@@ -27,6 +27,12 @@ HOST = "127.0.0.1"
 _HEADER = struct.Struct(">I")  # 4-byte big-endian length prefix
 _id_counter = itertools.count(1)
 
+# How long a connection thread waits for the single worker to finish a request
+# before giving up on it. Kept as a module default so behavior is unchanged when
+# the caller does not supply one; pro_bridge passes CFG.timeout_seconds instead of
+# this literal so a long geoprocessing run is not abandoned mid-flight (roadmap #1).
+DEFAULT_RESPONSE_TIMEOUT = 600
+
 
 def _next_id():
     return next(_id_counter)
@@ -65,18 +71,47 @@ def pick_free_port(host=HOST):
         s.close()
 
 
-def write_port_file(ipc_dir, port):
+def _restrict_file_permissions(path):
+    """Best-effort: make port.json readable only by the current user.
+
+    The token in port.json is a per-launch nonce that lets a client confirm it is
+    talking to THIS bridge (defends against a recycled/stale port owned by another
+    process). It is NOT a secret against a process running as the same user — such a
+    process can already read the file, sniff loopback, or attach to ArcGIS Pro. This
+    call simply removes the token from other local users' view. Never fatal: on any
+    failure the port file is still written with default permissions.
+    """
+    try:
+        if os.name == "nt":
+            import subprocess
+            user = os.environ.get("USERNAME") or os.environ.get("USER")
+            if not user:
+                return
+            # Strip inherited ACEs, then grant only the current user full control.
+            subprocess.run(
+                ["icacls", path, "/inheritance:r", "/grant:r", "%s:F" % user],
+                check=False, capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            os.chmod(path, 0o600)
+    except Exception:
+        pass  # hardening is best-effort; must never break port-file writing
+
+
+def write_port_file(ipc_dir, port, token=None):
     os.makedirs(ipc_dir, exist_ok=True)
     path = os.path.join(ipc_dir, "port.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"host": HOST, "port": int(port)}, f)
+        json.dump({"host": HOST, "port": int(port), "token": token}, f)
+    _restrict_file_permissions(path)
     return path
 
 
 def read_port_file(ipc_dir):
     with open(os.path.join(ipc_dir, "port.json"), "r", encoding="utf-8") as f:
         d = json.load(f)
-    return d.get("host", HOST), int(d["port"])
+    return d.get("host", HOST), int(d["port"]), d.get("token")
 
 
 # ── server (runs inside ArcGIS Pro) ──────────────────────────────────────────
@@ -85,11 +120,20 @@ class TransportServer:
     """Accepts connections on per-connection threads; dispatches requests serially
     on ONE worker thread. `dispatch(op, args)` returns a dict result."""
 
-    def __init__(self, dispatch, host=HOST, port=0):
+    def __init__(self, dispatch, host=HOST, port=0, token=None,
+                 response_timeout=DEFAULT_RESPONSE_TIMEOUT):
         self.dispatch = dispatch
         self.host = host
         self.port = port
-        self._srv = None
+        self.token = token          # greeted on every connection so clients can
+        self._srv = None            # confirm the peer is really this bridge
+        # Max seconds a connection thread waits for the worker before replying
+        # "no response". Should be >= the client's request timeout so the CLIENT
+        # (whose recv-timeout clock starts earlier) is the one that trips first —
+        # that yields a clean 'transport-inflight' on the client (never retried),
+        # instead of the server abandoning a still-running op and mislabeling it.
+        self.response_timeout = (response_timeout if response_timeout and response_timeout > 0
+                                 else DEFAULT_RESPONSE_TIMEOUT)
         self._stop = threading.Event()
         self._q = queue.Queue()
 
@@ -116,6 +160,10 @@ class TransportServer:
 
     def _handle_conn(self, conn):
         try:
+            try:
+                _send_msg(conn, {"hello": self.token})  # greet so clients can verify the peer
+            except OSError:
+                return
             while not self._stop.is_set():
                 try:
                     req = _recv_msg(conn)
@@ -123,7 +171,9 @@ class TransportServer:
                     break
                 box, done = {}, threading.Event()
                 self._q.put((req, box, done))
-                done.wait(timeout=600)
+                # Wait the CONFIGURED time (not a fixed 600 s). The worker keeps
+                # running past this deadline; we merely stop blocking this reply.
+                done.wait(timeout=self.response_timeout)
                 resp = box.get("resp") or {"id": req.get("id"), "ok": False,
                                            "error": "no response", "data": None}
                 try:
@@ -166,16 +216,34 @@ class TransportServer:
 
 # ── client (runs in the MCP server process) ──────────────────────────────────
 
-def send_request(port, op, args=None, host=HOST, timeout=60):
-    """One-shot request. Returns the response dict, or an error dict on failure."""
+def send_request(port, op, args=None, host=HOST, timeout=60, token=None):
+    """One-shot request.
+
+    Performs a fast handshake first: the bridge greets every connection with its
+    token. If the greeting is missing/mismatched (e.g. a stale port.json now owned
+    by another process), this is reported as a PRE-dispatch 'transport-connect:'
+    failure — safe to fall back to file IPC. Only failures AFTER the request was
+    actually sent to a verified bridge are 'transport-inflight:' (must NOT be
+    retried — the command may be executing and retrying would duplicate effects).
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
     try:
-        s.connect((host, port))
-        _send_msg(s, {"id": _next_id(), "op": op, "args": args or {}})
-        return _recv_msg(s)
-    except (socket.timeout, ConnectionError, OSError) as e:
-        return {"ok": False, "error": "transport: %s" % e, "data": None}
+        # connect + handshake on a short timeout so a wrong/dead peer fails fast
+        s.settimeout(min(timeout, 5) or 5)
+        try:
+            s.connect((host, port))
+            hello = _recv_msg(s)
+        except (socket.timeout, ConnectionError, OSError, ValueError, json.JSONDecodeError) as e:
+            return {"ok": False, "error": "transport-connect: %s" % e, "data": None}
+        if token is not None and (not isinstance(hello, dict) or hello.get("hello") != token):
+            return {"ok": False, "error": "transport-connect: peer is not the MCP bridge", "data": None}
+        # verified peer -> send the real request on the full timeout
+        s.settimeout(timeout)
+        try:
+            _send_msg(s, {"id": _next_id(), "op": op, "args": args or {}})
+            return _recv_msg(s)
+        except (socket.timeout, ConnectionError, OSError) as e:
+            return {"ok": False, "error": "transport-inflight: %s" % e, "data": None}
     finally:
         try:
             s.close()

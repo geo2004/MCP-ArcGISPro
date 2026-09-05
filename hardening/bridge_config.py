@@ -33,7 +33,12 @@ class BridgeConfig:
         "analysis.", "management.", "conversion.", "cartography.",
         "sa.", "ddd.", "stats.", "ca.", "intelligence.",
     ])
-    blocked_gp_tools: List[str] = field(default_factory=list)
+    # Destructive tools blocked by default in safe mode (alias-normalized, so the
+    # one-part forms like 'Delete_management' are blocked too). Override per deployment.
+    blocked_gp_tools: List[str] = field(default_factory=lambda: [
+        "management.Delete", "management.DeleteFeatures", "management.DeleteRows",
+        "management.DeleteField", "management.DeleteIdentical", "management.TruncateTable",
+    ])
 
     ipc_dir: str = DEFAULT_IPC
 

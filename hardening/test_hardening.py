@@ -67,6 +67,14 @@ def test_config_roundtrip():
 def test_safety():
     print("[safety]")
     cfg = bc.BridgeConfig()  # safe_mode True
+    # destructive tools blocked by DEFAULT (both alias forms)
+    def _isblk(t):
+        try:
+            bs.check_gp_tool(t, bc.BridgeConfig()); return False
+        except bs.SafetyError:
+            return True
+    check("management.Delete blocked by default", _isblk("management.Delete"))
+    check("Delete_management blocked by default (alias)", _isblk("Delete_management"))
     # execute_python blocked in safe mode
     blocked = False
     try:
@@ -98,6 +106,16 @@ def test_safety():
         denied = True
     check("unknown toolbox blocked in safe mode", denied)
 
+    # legacy one-part names: 'Buffer_analysis' allowed, 'DoBad_evil' blocked
+    def _blk(t):
+        try:
+            bs.check_gp_tool(t, cfg); return False
+        except bs.SafetyError:
+            return True
+    check("one-part Buffer_analysis allowed", not _blk("Buffer_analysis"))
+    check("one-part CopyFeatures_management allowed", not _blk("CopyFeatures_management"))
+    check("one-part DoBad_evil blocked", _blk("DoBad_evil"))
+
     # blocklist wins
     cfg.blocked_gp_tools = ["management.Delete"]
     blk = False
@@ -106,6 +124,17 @@ def test_safety():
     except bs.SafetyError:
         blk = True
     check("blocklisted tool rejected", blk)
+    # blocklist can't be bypassed via the equivalent one-part form
+    bypass_blocked = False
+    try:
+        bs.check_gp_tool("Delete_management", cfg)
+    except bs.SafetyError:
+        bypass_blocked = True
+    check("blocklist not bypassable via alias form", bypass_blocked)
+    # blocklist can't be bypassed via case (management.delete vs blocked management.Delete)
+    check("blocklist not bypassable via lowercase", _blk("management.delete"))
+    check("blocklist not bypassable via uppercase", _blk("MANAGEMENT.DELETE"))
+    check("blocklist not bypassable via mixed-case alias form", _blk("delete_MANAGEMENT"))
 
     # safe_mode off -> anything passes
     cfg.safe_mode = False
@@ -145,6 +174,51 @@ def test_resolve_dataset():
     check("resolve_param unknown passthrough (no raise)", bh.resolve_param(arcpy, m, "nope") == "nope")
 
 
+def test_recipe_gate():
+    print("[recipe_gate]")
+    import recipes as rc
+
+    # 1) every recipe declares gp_tools (a list) so handle_recipe can gate it
+    all_declared = all(isinstance(getattr(fn, "gp_tools", None), list)
+                       for fn in rc.RECIPES.values())
+    check("every recipe declares a gp_tools list", all_declared)
+
+    # 2) the gate handle_recipe applies: check_gp_tool over each declared tool.
+    #    qa_layer declares management.GetCount -> allowed by default policy...
+    cfg = bc.BridgeConfig()  # safe_mode True, default allow/blocklists
+
+    def _gate(fn):
+        """Mirror handle_recipe's gate: raises SafetyError if any declared tool blocked."""
+        for t in (getattr(fn, "gp_tools", []) or []):
+            bs.check_gp_tool(t, cfg)
+
+    def _blocked(fn):
+        try:
+            _gate(fn); return False
+        except bs.SafetyError:
+            return True
+
+    check("qa_layer passes the gate under default policy", not _blocked(rc.RECIPES["qa_layer"]))
+    check("read-only recipe (value_counts) passes the gate", not _blocked(rc.RECIPES["value_counts"]))
+
+    # 3) ...but if the recipe's declared GP tool is blocklisted, the gate rejects it.
+    cfg.blocked_gp_tools = ["management.GetCount"]
+    check("recipe blocked when its declared GP tool is blocklisted", _blocked(rc.RECIPES["qa_layer"]))
+
+    # 4) a hypothetical destructive recipe declaring a default-blocked tool is caught
+    def _fake_destructive_recipe(**_):
+        return {}
+    _fake_destructive_recipe.gp_tools = ["management.DeleteFeatures"]
+    cfg2 = bc.BridgeConfig()  # default blocklist includes DeleteFeatures
+    caught = False
+    try:
+        for t in _fake_destructive_recipe.gp_tools:
+            bs.check_gp_tool(t, cfg2)
+    except bs.SafetyError:
+        caught = True
+    check("destructive recipe caught by default blocklist", caught)
+
+
 def test_envelopes():
     print("[envelopes]")
     o = bh.ok({"x": 1})
@@ -158,6 +232,7 @@ if __name__ == "__main__":
     test_config_roundtrip()
     test_safety()
     test_resolve_dataset()
+    test_recipe_gate()
     test_envelopes()
     print("\n{} passed, {} failed".format(_passed, _failed))
     sys.exit(1 if _failed else 0)

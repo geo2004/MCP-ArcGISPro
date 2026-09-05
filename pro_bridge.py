@@ -38,6 +38,50 @@ os.makedirs(IPC_DIR, exist_ok=True)
 _proj = arcpy.mp.ArcGISProject("CURRENT")
 arcpy.env.overwriteOutput = True
 
+# ── Hardening layer (optional; degrades gracefully if not found) ──────────────
+# Loaded when launched via the toolbox / a path that sets __file__. If the
+# hardening package isn't importable, the bridge keeps working with built-in
+# defaults (original behavior).
+import sys
+_HARDENING = False
+try:
+    _base = os.path.dirname(os.path.abspath(__file__))
+    if _base not in sys.path:
+        sys.path.insert(0, _base)
+    from hardening.bridge_config import BridgeConfig
+    from hardening.bridge_safety import check_gp_tool, check_execute_python, SafetyError
+    from hardening.bridge_helpers import resolve_param
+    from hardening.bridge_logging import get_logger, audit
+    CFG = BridgeConfig.load()
+    LOG = get_logger(IPC_DIR, CFG.log_level)
+    _HARDENING = True
+    print("[MCP Bridge] Hardening loaded (safe_mode=%s, timeout=%ss)." % (CFG.safe_mode, CFG.timeout_seconds))
+except Exception as _e:  # noqa: BLE001 - graceful fallback by design
+    print("[MCP Bridge] Hardening not loaded (%r); using built-in defaults." % _e)
+
+    class _CFG:
+        protocol_version = 1
+        auto_create_map = False
+    CFG = _CFG()
+
+    class SafetyError(Exception):
+        pass
+
+    def check_gp_tool(tool, cfg):
+        return None
+
+    def check_execute_python(cfg):
+        return None
+
+    def resolve_param(_arcpy, _m, p):
+        return p
+
+    def get_logger(*a, **k):
+        return None
+
+    def audit(*a, **k):
+        return None
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ok(data):
@@ -54,9 +98,12 @@ def _get_map():
     maps = _proj.listMaps()
     if maps:
         return maps[0]
-    # No maps at all — create one silently in the background
+    # No maps at all
+    if not getattr(CFG, "auto_create_map", False):
+        raise RuntimeError("No map in this project. Create or open a Map in ArcGIS Pro, "
+                           "or set auto_create_map=true in config.json.")
     m = _proj.createMap("Map")
-    print("[MCP Bridge] No map found — created 'Map' automatically. Open it in ArcGIS Pro to see it.")
+    print("[MCP Bridge] No map found — created 'Map' automatically (auto_create_map=true).")
     return m
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -247,6 +294,10 @@ def handle_run_geoprocessing(args):
     params = args.get("params", [])
     if not tool_path:
         raise ValueError("'tool' is required (e.g. 'analysis.Buffer')")
+    check_gp_tool(tool_path, CFG)
+    # Resolve any params that are layer NAMES into their dataSource path.
+    # No-op for distances ("10 Meters"), field names, numbers, output paths.
+    params = [resolve_param(arcpy, _proj.activeMap, p) for p in params]
     parts = tool_path.split(".")
     if len(parts) == 2:
         fn = getattr(getattr(arcpy, parts[0]), parts[1])
@@ -484,6 +535,7 @@ def handle_execute_python(args):
     """
     import io, contextlib
 
+    check_execute_python(CFG)
     code = args.get("code", "")
     if not code:
         raise ValueError("'code' is required")
@@ -721,13 +773,24 @@ def _poll_loop():
                 op      = cmd.get("op", "")
                 handler = HANDLERS.get(op)
 
+                _t0 = time.time()
                 if handler:
                     try:
                         result = handler(cmd.get("args", {}))
+                    except SafetyError as e:
+                        result = _err(f"Policy: {e}")
                     except Exception as e:
                         result = _err(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
                 else:
                     result = _err(f"Unknown command: '{op}'. Available: {sorted(HANDLERS)}")
+
+                # hardening: stamp protocol version + write an audit line
+                if isinstance(result, dict):
+                    result.setdefault("protocol", getattr(CFG, "protocol_version", 1))
+                try:
+                    audit(LOG, op, cmd.get("args", {}), result.get("ok"), (time.time() - _t0) * 1000)
+                except Exception:
+                    pass
 
                 with open(RESULT_FILE, "w", encoding="utf-8") as f:
                     json.dump(result, f, default=str)

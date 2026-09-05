@@ -40,11 +40,24 @@ IPC_DIR = os.path.join(os.path.expanduser("~"), ".arcgis_mcp")
 CMD_FILE = os.path.join(IPC_DIR, "command.json")
 RESULT_FILE = os.path.join(IPC_DIR, "result.json")
 LOCK_FILE = os.path.join(IPC_DIR, "lock")
-TIMEOUT = 120  # seconds to wait for ArcGIS Pro to respond — live-hit at 15s: a real
-                # publish_web_layer call took 32s and the old 15s timeout reported a
-                # false "Timeout" even though it was quietly succeeding server-side
-
 os.makedirs(IPC_DIR, exist_ok=True)
+
+
+def _load_timeout(default=120):
+    """Timeout is configurable via <ipc_dir>/config.json (hardening layer).
+
+    Default is 120s: a live publish_web_layer call took ~32s, and the old 15s
+    timeout reported a false "Timeout" while the operation was quietly succeeding
+    server-side. Override per-install via config.json's timeout_seconds.
+    """
+    try:
+        with open(os.path.join(IPC_DIR, "config.json"), "r", encoding="utf-8") as f:
+            return int(json.load(f).get("timeout_seconds", default))
+    except Exception:
+        return default
+
+
+TIMEOUT = _load_timeout()  # seconds to wait for ArcGIS Pro to respond (was 15, now 120)
 
 mcp = FastMCP(
     "ArcGIS Pro",

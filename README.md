@@ -18,6 +18,7 @@ Connects Claude Desktop (or any MCP client) to a live ArcGIS Pro session, enabli
 - Zoom to layers, toggle visibility, save projects
 - Bulk-edit attribute values on features matching a query
 - Publish a layer as a hosted feature service to ArcGIS Online / Enterprise
+- Run one-call recipes: layer QC report, attribute export to CSV, batch layout export, field stats, value counts
 - Execute arbitrary ArcPy / arcpy.mp code
 
 ---
@@ -95,8 +96,14 @@ exec(open(p).read(), {"__file__": p})
 
 > Passing `{"__file__": p}` lets the optional hardening/recipes/socket layer (which
 > lives next to `pro_bridge.py`) load. Plain `exec(open(p).read())` still runs the
-> core bridge, but only with built-in defaults. Easiest of all: use the **MCP Bridge
-> toolbox** (Start button), which handles this for you.
+> core bridge, but only with built-in defaults (no safe_mode, no recipes, no socket
+> transport).
+>
+> **Easiest of all:** in the Catalog pane → Toolboxes → right-click → Add Toolbox →
+> select `MCP_Bridge.pyt`. Then double-click **Start MCP Bridge** under it (Run) —
+> no need to open the Python window or type anything. **Stop MCP Bridge** /
+> **MCP Bridge Status** work the same way. This loads the hardening layer
+> automatically, same as passing `__file__` above.
 
 You should see:
 ```
@@ -133,7 +140,7 @@ Just talk to Claude naturally. Examples:
 
 ---
 
-## Available Tools (31)
+## Available Tools (32)
 
 | Category | Tools |
 |---|---|
@@ -148,6 +155,7 @@ Just talk to Claude naturally. Examples:
 | **Geoprocessing** | `run_geoprocessing` *(any arcpy tool by dotted name)* |
 | **Layout & Export** | `list_layouts`, `create_layout`, `export_layout` |
 | **Sharing** | `publish_web_layer` *(hosted feature service to ArcGIS Online/Enterprise)* |
+| **Recipes** | `run_recipe` *(qa_layer, export_attributes_csv, batch_export_layouts, field_stats, value_counts — requires the hardening layer loaded)* |
 | **Advanced** | `execute_python` *(arbitrary arcpy/arcpy.mp code)* |
 
 ---
@@ -166,9 +174,23 @@ arcpy / arcpy.mp                        arcgis (ArcGIS API for Python)
 ArcGIS Pro (live session)               ArcGIS Online / Enterprise portal, over REST
 ```
 
-The bridge uses file-based IPC (command / result JSON files in `~/.arcgis_mcp/`) — no sockets, no named pipes, no compilation required.
+File-based IPC (command / result JSON files in `~/.arcgis_mcp/`) always works and needs no setup. When the hardening layer loads (see below), a localhost socket transport starts alongside it and becomes the preferred path — lower latency, no polling — with file IPC as the automatic fallback if the socket is ever unavailable. Either way, no compilation required.
 
 Almost everything goes through `arcpy`/`arcpy.mp` against the live local session. **`publish_web_layer` is the one exception**, and deliberately so: `arcpy.server`/`arcpy.mp.CreateWebLayerSDDraft` are COM-based and need the signed-in portal session in a way that's only available on ArcGIS Pro's true main thread — not the background thread this bridge dispatches every command from. Rather than block on that, `publish_web_layer` uses the `arcgis` package instead, which talks to the portal over plain REST (reusing the same Pro sign-in via `arcpy.GetSigninToken()`, no separate login) — REST has no thread affinity, so it works fine from here. Same pattern is available for other portal-side operations (content management, sharing, editing an already-published layer, user/group admin) if this bridge grows in that direction later — those aren't subject to the thread limitation either.
+
+---
+
+## Safety & Configuration
+
+When the bridge is started via the toolbox (or manual `exec` with `__file__`), an optional hardening layer loads and applies safe defaults:
+
+- **`execute_python` is disabled** unless you opt in — arbitrary code execution is off by default.
+- **`run_geoprocessing` is restricted to an allowlist** of toolbox prefixes (`analysis.`, `management.`, `conversion.`, `cartography.`, `sa.`, `ddd.`, `stats.`, `ca.`, `intelligence.`), plus a **blocklist** for destructive tools (`Delete`, `DeleteFeatures`, `DeleteRows`, `DeleteField`, `DeleteIdentical`, `TruncateTable`) even within an allowed toolbox. The blocklist check is case- and alias-insensitive (`management.delete` and `Delete_management` are both caught).
+- **Bridge no longer silently creates a map** if none exists — it asks instead, unless `auto_create_map` is turned back on.
+- **Timeout is configurable** (default 60s) instead of a hardcoded 15s that was too short for slower geoprocessing/publish calls.
+- **`run_recipe` is gated the same way** — each recipe declares which GP tools (if any) it needs, and those go through the same allowlist/blocklist check.
+
+To change any of this, copy `hardening/config.example.json` to `~/.arcgis_mcp/config.json` and edit. If the hardening layer fails to load for any reason, the bridge falls back to its original, fully-open behavior (with a console message saying so) — so a broken `hardening/` install never silently blocks you, but also isn't a safety net you should rely on.
 
 ---
 
@@ -181,7 +203,9 @@ Almost everything goes through `arcpy`/`arcpy.mp` against the live local session
 
 ## Stopping the Bridge
 
-In the ArcGIS Pro Python window:
+If you started it via the **MCP Bridge toolbox**, double-click **Stop MCP Bridge**.
+
+If you started it manually in the Python window:
 
 ```python
 _bridge_active = False

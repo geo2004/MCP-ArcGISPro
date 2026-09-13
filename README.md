@@ -116,6 +116,35 @@ You should see:
 
 Restart Claude Desktop after updating the config. The ArcGIS Pro tools will appear automatically.
 
+### Optional: let a cloud agent (Claude Cowork) start ArcGIS Pro for you
+
+Claude Cowork runs in the cloud and has no shell access to your machine — its
+only reach here is through whichever local MCP servers Claude Desktop bridges
+to it, each exposing a fixed, specific set of tools. None of the servers above
+can *launch* ArcGIS Pro, only talk to it once it's already running.
+
+`pro_launcher_server.py` closes that one gap, deliberately narrowly: it exposes
+exactly two tools — `get_launcher_status` (is Pro reachable right now?) and
+`ensure_arcgis_pro_running` (launch it if not, and wait for it to come up) —
+and nothing else. It's not a general remote-shell; it can only start this one
+program. Add it as its own entry, same pattern as `arcgis-pro` above:
+
+```json
+"arcgis-pro-launcher": {
+  "command": "C:/Users/<YourUsername>/.local/bin/uv.exe",
+  "args": [
+    "--directory",
+    "C:/path/to/MCP-ArcGISPro",
+    "run",
+    "pro_launcher_server.py"
+  ]
+}
+```
+
+Requires the companion [C# add-in](https://github.com/geo2004/MCP-ArcGISPro-AddIn)
+(v3.2+) — it checks that add-in's `/status` endpoint to know whether Pro is up,
+so this only helps if that add-in is also installed and registered.
+
 ---
 
 ## Usage

@@ -48,6 +48,47 @@ os.makedirs(IPC_DIR, exist_ok=True)
 _proj = arcpy.mp.ArcGISProject("CURRENT")
 arcpy.env.overwriteOutput = True
 
+# ── Cross-bridge sync: pick up projects opened by the companion C# add-in ─────
+# _proj above goes stale the moment something ELSE (e.g. the C# add-in, which has
+# its own live, thread-safe view of Project.Current) opens or creates a different
+# project -- this bridge has no way to notice on its own. Calling
+# ArcGISProject("CURRENT") again from this background thread to re-check throws
+# OSError, same as ever (that's why it was cached in the first place). But opening
+# by an EXPLICIT path, unlike "CURRENT", works fine from any thread -- confirmed
+# live 2026-09-13. The add-in exposes exactly that path over a plain REST endpoint
+# (no MCP handshake needed) specifically for this. If the add-in isn't installed
+# or isn't running, every check just fails silently and this behaves exactly as
+# before -- no manual re-arm required only when both bridges are actually in play.
+ADDIN_STATUS_URL = "http://localhost:5057/status"
+_SYNC_INTERVAL = 2.0  # seconds between checks -- cheap when skipped, rare enough not to spam a closed port
+_last_sync_check = 0.0
+
+def _maybe_sync_project_from_addin():
+    global _proj, _last_sync_check
+    now = time.time()
+    if now - _last_sync_check < _SYNC_INTERVAL:
+        return
+    _last_sync_check = now
+    try:
+        import urllib.request
+        with urllib.request.urlopen(ADDIN_STATUS_URL, timeout=0.4) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return  # add-in not running/not installed -- standalone behavior, unchanged
+
+    new_path = info.get("projectPath")
+    if not new_path:
+        return
+    current_path = _proj.filePath or ""
+    if os.path.normcase(os.path.normpath(new_path)) == os.path.normcase(os.path.normpath(current_path)):
+        return
+
+    try:
+        _proj = arcpy.mp.ArcGISProject(new_path)
+        print("[MCP Bridge] Re-synced to project opened by the C# add-in: %s" % new_path)
+    except Exception as e:
+        print("[MCP Bridge] Failed to re-sync to add-in's project (%s): %s" % (new_path, e))
+
 # ── Hardening layer (optional; degrades gracefully if not found) ──────────────
 # Loaded when launched via the toolbox / a path that sets __file__. If the
 # hardening package isn't importable, the bridge keeps working with built-in
@@ -916,6 +957,8 @@ def _poll_loop():
 
     while _bridge_active:
         try:
+            _maybe_sync_project_from_addin()
+
             if not os.path.exists(CMD_FILE):
                 time.sleep(_idle)
                 _idle = min(_idle * 2, _MAX_POLL)
